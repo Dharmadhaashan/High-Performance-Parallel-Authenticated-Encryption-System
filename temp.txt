@@ -1,0 +1,223 @@
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <chrono>
+#include <algorithm>
+
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+
+using namespace std;
+
+// ==============================
+// CONFIG
+// ==============================
+vector<int> DATA_SIZES = {100, 200, 500, 1000};
+vector<int> CHUNK_SIZES = {
+    1 * 1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024
+};
+
+vector<int> THREAD_COUNTS = {1, 2, 4, 8, 16};
+
+// ==============================
+// DATA
+// ==============================
+vector<unsigned char> generate_data(int size_mb) {
+    return vector<unsigned char>(size_mb * 1024 * 1024, 'A');
+}
+
+// ==============================
+// AES-CTR ENCRYPT
+// ==============================
+void aes_ctr_encrypt(
+    const unsigned char* data,
+    size_t len,
+    unsigned char* out,
+    const unsigned char* key,
+    const unsigned char* iv)
+{
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+
+    int out_len = 0, total = 0;
+
+    EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), NULL, key, iv);
+    EVP_EncryptUpdate(ctx, out, &out_len, data, len);
+    total = out_len;
+
+    EVP_EncryptFinal_ex(ctx, out + total, &out_len);
+
+    EVP_CIPHER_CTX_free(ctx);
+}
+
+// ==============================
+// AES-GCM BASELINE
+// ==============================
+double run_aes_gcm(const vector<unsigned char>& data)
+{
+    unsigned char key[16] = {0};
+    unsigned char iv[12] = {0};
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+
+    vector<unsigned char> out(data.size() + 16);
+    int len;
+
+    auto start = chrono::high_resolution_clock::now();
+
+    EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, key, iv);
+    EVP_EncryptUpdate(ctx, out.data(), &len, data.data(), data.size());
+    EVP_EncryptFinal_ex(ctx, out.data() + len, &len);
+
+    auto end = chrono::high_resolution_clock::now();
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    return chrono::duration<double>(end - start).count();
+}
+
+// ==============================
+// HMAC
+// ==============================
+vector<unsigned char> compute_hmac(
+    const unsigned char* data,
+    size_t len)
+{
+    unsigned int out_len;
+
+    unsigned char* result = HMAC(
+        EVP_sha256(),
+        "hmackey", 7,
+        data,
+        len,
+        NULL,
+        &out_len
+    );
+
+    return vector<unsigned char>(result, result + out_len);
+}
+
+// ==============================
+// TREE
+// ==============================
+vector<unsigned char> combine_pair(
+    const vector<unsigned char>& a,
+    const vector<unsigned char>& b)
+{
+    vector<unsigned char> combined = a;
+    combined.insert(combined.end(), b.begin(), b.end());
+
+    return compute_hmac(combined.data(), combined.size());
+}
+
+vector<unsigned char> build_tree(vector<vector<unsigned char>> nodes)
+{
+    while (nodes.size() > 1) {
+        vector<vector<unsigned char>> next;
+
+        for (size_t i = 0; i < nodes.size(); i += 2) {
+            if (i + 1 < nodes.size())
+                next.push_back(combine_pair(nodes[i], nodes[i + 1]));
+            else
+                next.push_back(nodes[i]);
+        }
+
+        nodes = next;
+    }
+    return nodes[0];
+}
+
+// ==============================
+// PARALLEL (THREAD SCALABLE)
+// ==============================
+double run_parallel(
+    const vector<unsigned char>& data,
+    int chunk_size,
+    int num_threads)
+{
+    size_t num_chunks = (data.size() + chunk_size - 1) / chunk_size;
+
+    vector<vector<unsigned char>> tags(num_chunks);
+
+    unsigned char key[16] = {0};
+    unsigned char iv[16] = {0};
+
+    auto start = chrono::high_resolution_clock::now();
+
+    vector<thread> workers;
+
+    for (int t = 0; t < num_threads; t++) {
+        workers.emplace_back([&, t]() {
+
+            vector<unsigned char> buffer(chunk_size + 16);
+
+            for (size_t i = t; i < num_chunks; i += num_threads) {
+
+                size_t s = i * chunk_size;
+                size_t e = min(s + chunk_size, data.size());
+
+                size_t len = e - s;
+
+                aes_ctr_encrypt(
+                    data.data() + s,
+                    len,
+                    buffer.data(),
+                    key,
+                    iv
+                );
+
+                tags[i] = compute_hmac(buffer.data(), len);
+            }
+        });
+    }
+
+    for (auto& t : workers) t.join();
+
+    auto root = build_tree(tags);
+
+    compute_hmac(root.data(), root.size());
+
+    auto end = chrono::high_resolution_clock::now();
+    return chrono::duration<double>(end - start).count();
+}
+
+// ==============================
+// MAIN
+// ==============================
+int main()
+{
+    cout << "===== FINAL RESEARCH EXPERIMENT =====\n";
+
+    for (int size : DATA_SIZES) {
+
+        cout << "\n=============================\n";
+        cout << "DATA SIZE: " << size << " MB\n";
+
+        auto data = generate_data(size);
+
+        // BASELINE
+        double gcm_time = run_aes_gcm(data);
+        double gcm_tp = size / gcm_time;
+
+        cout << "\nAES-GCM Throughput: " << gcm_tp << " MB/s\n";
+
+        for (int chunk : CHUNK_SIZES) {
+
+            cout << "\nChunk Size: " << chunk / (1024 * 1024) << " MB\n";
+
+            for (int threads : THREAD_COUNTS) {
+
+                double t_par = run_parallel(data, chunk, threads);
+
+                double tp = size / t_par;
+
+                cout << "Threads: " << threads
+                     << " | Time: " << t_par
+                     << " | Throughput: " << tp
+                     << " | vs AES-GCM: " << (tp / gcm_tp)
+                     << "x\n";
+            }
+        }
+    }
+}
